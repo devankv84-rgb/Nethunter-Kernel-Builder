@@ -24,16 +24,22 @@ name: Build NetHunter Kernel (Samsung gtowifi - LineageOS 22.2)
 #   so Clang/LLVM (as AOSP ships) usually works, but this workflow defaults
 #   to GCC for safety — switch to Clang if the kernel's own docs recommend it.
 #
-# FIX APPLIED IN THIS VERSION:
-# The previous run failed with:
-#   "arch/arm64/Makefile:66: *** CROSS_COMPILE_ARM32 not defined or empty,
-#    the compat vDSO will not be built.  Stop."
-# This happens because arm64 Android kernels build a 32-bit "compat vDSO"
-# alongside the 64-bit kernel (for 32-bit app compatibility), which needs
-# its own separate 32-bit ARM toolchain — distinct from the 64-bit one used
-# for everything else. This version installs that toolchain and sets
-# CROSS_COMPILE_ARM32 alongside CROSS_COMPILE, and passes both through to
-# every make invocation that builds the kernel.
+# FIX HISTORY:
+# v2 fixed: "CROSS_COMPILE_ARM32 not defined or empty" by installing apt's
+#   gcc-arm-linux-gnueabi and setting CROSS_COMPILE_ARM32.
+# v3 (this version) fixes the NEXT error that appeared:
+#   "ld: cannot represent machine `arm'" while linking arch/arm64/kernel/
+#   vdso32/vdso.so.raw
+# Root cause: the vdso32 Makefile in this kernel links with -fuse-ld=bfd.
+# GCC expects a target-prefixed "ld.bfd" binary to satisfy that flag, but
+# Ubuntu's apt gcc-arm-linux-gnueabi package doesn't ship one under that
+# name, so the build silently falls through to the HOST's 64-bit x86 ld —
+# which cannot emit 32-bit ARM output, producing this exact error.
+# Fix: stop using apt's cross-toolchain and instead pull Google/AOSP's
+# prebuilt GCC toolchains (the ones Android kernels are actually built and
+# tested against) for both the 64-bit and 32-bit-compat compilers. This is
+# the standard approach used by essentially every real Android kernel CI
+# pipeline, and it sidesteps the ld.bfd naming issue entirely.
 # ---------------------------------------------------------------------------
 
 on:
@@ -49,7 +55,7 @@ on:
 
 env:
   DEVICE_CODENAME: gtowifi                      # Samsung Galaxy Tab A 8.0 (2019)
-  DEFCONFIG: lineageos_gtowifi_defconfig            # <<< confirm against arch/arm64/configs/ in the repo >>>
+  DEFCONFIG: lineageos_gtowifi_defconfig             # <<< confirm against arch/arm64/configs/ in the repo >>>
   KERNEL_REPO: https://github.com/LineageOS/android_kernel_samsung_sdm429.git
   KERNEL_BRANCH: lineage-22.2                   # <<< confirm this branch exists; fall back if not pushed yet >>>
   NETHUNTER_KERNEL_BUILDER: https://gitlab.com/kalilinux/nethunter/build-scripts/kali-nethunter-project.git
@@ -74,9 +80,24 @@ jobs:
           sudo apt-get install -y \
             git build-essential bc bison flex libssl-dev libncurses-dev \
             python3 python3-pip lz4 zip unzip wget curl \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi g++-arm-linux-gnueabi \
             device-tree-compiler cpio rsync
+          # NOTE: no gcc-aarch64-linux-gnu / gcc-arm-linux-gnueabi here anymore —
+          # see "Pull toolchains" step below for why.
+
+      - name: Pull prebuilt AOSP toolchains
+        run: |
+          # These are Google's own prebuilt GCC toolchains (mirrored by
+          # LineageOS), the ones Android kernels are built and tested
+          # against upstream. Using these instead of apt's cross-compilers
+          # avoids the ld.bfd naming mismatch that broke the vdso32 build.
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            toolchain-aarch64
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
+            toolchain-arm32
+          echo "TOOLCHAIN_AARCH64=$GITHUB_WORKSPACE/toolchain-aarch64/bin" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_ARM32=$GITHUB_WORKSPACE/toolchain-arm32/bin" >> "$GITHUB_ENV"
 
       - name: Checkout kernel source
         run: |
@@ -117,11 +138,11 @@ jobs:
 
       - name: Set up toolchain
         run: |
-          # <<< If your device's kernel is too old for Clang, switch CC below to
-          # aarch64-linux-gnu-gcc and drop the clang-related env vars. >>>
-          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
-          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE=${{ env.TOOLCHAIN_AARCH64 }}/aarch64-linux-android-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE_ARM32=${{ env.TOOLCHAIN_ARM32 }}/arm-linux-androideabi-" >> "$GITHUB_ENV"
           echo "ARCH=arm64" >> "$GITHUB_ENV"
+          echo "${{ env.TOOLCHAIN_AARCH64 }}" >> "$GITHUB_PATH"
+          echo "${{ env.TOOLCHAIN_ARM32 }}" >> "$GITHUB_PATH"
 
       - name: Configure kernel
         working-directory: kernel_source
