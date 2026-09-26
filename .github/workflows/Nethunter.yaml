@@ -27,19 +27,24 @@ name: Build NetHunter Kernel (Samsung gtowifi - LineageOS 22.2)
 # FIX HISTORY:
 # v2 fixed: "CROSS_COMPILE_ARM32 not defined or empty" by installing apt's
 #   gcc-arm-linux-gnueabi and setting CROSS_COMPILE_ARM32.
-# v3 (this version) fixes the NEXT error that appeared:
-#   "ld: cannot represent machine `arm'" while linking arch/arm64/kernel/
-#   vdso32/vdso.so.raw
-# Root cause: the vdso32 Makefile in this kernel links with -fuse-ld=bfd.
-# GCC expects a target-prefixed "ld.bfd" binary to satisfy that flag, but
-# Ubuntu's apt gcc-arm-linux-gnueabi package doesn't ship one under that
-# name, so the build silently falls through to the HOST's 64-bit x86 ld —
-# which cannot emit 32-bit ARM output, producing this exact error.
-# Fix: stop using apt's cross-toolchain and instead pull Google/AOSP's
-# prebuilt GCC toolchains (the ones Android kernels are actually built and
-# tested against) for both the 64-bit and 32-bit-compat compilers. This is
-# the standard approach used by essentially every real Android kernel CI
-# pipeline, and it sidesteps the ld.bfd naming issue entirely.
+# v3 fixed: "ld: cannot represent machine `arm'" (vdso32 link failure) by
+#   switching from apt's cross-toolchain to prebuilt AOSP GCC 4.9 toolchains.
+# v4 (this version) fixes the NEXT error that appeared:
+#   "../include/linux/compiler-gcc.h:157:3: error: #error Sorry, your
+#    version of GCC is too old - please use 5.1 or newer."
+# Root cause: this kernel source tree enforces a minimum GCC version (5.1+)
+# in its headers. The GCC 4.9 prebuilt toolchain from v3 (needed to dodge
+# the vdso32 ld.bfd issue) is itself too old to satisfy that check — one
+# fix broke against the other constraint.
+# Fix: stop using GCC entirely and switch to Clang. Modern LineageOS-era
+# kernel trees (even for older SoCs like SDM429) are built and tested
+# against Clang upstream, not GCC. This version uses Proton Clang — a
+# widely used, actively maintained prebuilt package that bundles Clang
+# together with its own correctly-built GNU binutils (assembler/linker) for
+# both the 64-bit and 32-bit-compat targets. Clang reports a GCC-compatible
+# version high enough to pass the version check, and its bundled binutils
+# avoids the ld.bfd naming issue from v3 as well — so this should resolve
+# both prior errors at once.
 # ---------------------------------------------------------------------------
 
 on:
@@ -84,20 +89,13 @@ jobs:
           # NOTE: no gcc-aarch64-linux-gnu / gcc-arm-linux-gnueabi here anymore —
           # see "Pull toolchains" step below for why.
 
-      - name: Pull prebuilt AOSP toolchains
+      - name: Pull Proton Clang toolchain
         run: |
-          # These are Google's own prebuilt GCC toolchains (mirrored by
-          # LineageOS), the ones Android kernels are built and tested
-          # against upstream. Using these instead of apt's cross-compilers
-          # avoids the ld.bfd naming mismatch that broke the vdso32 build.
-          git clone --depth=1 \
-            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
-            toolchain-aarch64
-          git clone --depth=1 \
-            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
-            toolchain-arm32
-          echo "TOOLCHAIN_AARCH64=$GITHUB_WORKSPACE/toolchain-aarch64/bin" >> "$GITHUB_ENV"
-          echo "TOOLCHAIN_ARM32=$GITHUB_WORKSPACE/toolchain-arm32/bin" >> "$GITHUB_ENV"
+          # Proton Clang bundles Clang + correctly-built GNU binutils for
+          # both aarch64 and 32-bit-compat arm targets in one package.
+          # This replaces the GCC 4.9 toolchains from the previous version.
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git proton-clang
+          echo "TOOLCHAIN_BIN=$GITHUB_WORKSPACE/proton-clang/bin" >> "$GITHUB_ENV"
 
       - name: Checkout kernel source
         run: |
@@ -138,18 +136,29 @@ jobs:
 
       - name: Set up toolchain
         run: |
-          echo "CROSS_COMPILE=${{ env.TOOLCHAIN_AARCH64 }}/aarch64-linux-android-" >> "$GITHUB_ENV"
-          echo "CROSS_COMPILE_ARM32=${{ env.TOOLCHAIN_ARM32 }}/arm-linux-androideabi-" >> "$GITHUB_ENV"
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE=${{ env.TOOLCHAIN_BIN }}/aarch64-linux-gnu-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE_ARM32=${{ env.TOOLCHAIN_BIN }}/arm-linux-gnueabi-" >> "$GITHUB_ENV"
+          echo "LD=ld.lld" >> "$GITHUB_ENV"
+          echo "AR=llvm-ar" >> "$GITHUB_ENV"
+          echo "NM=llvm-nm" >> "$GITHUB_ENV"
+          echo "OBJCOPY=llvm-objcopy" >> "$GITHUB_ENV"
+          echo "OBJDUMP=llvm-objdump" >> "$GITHUB_ENV"
+          echo "STRIP=llvm-strip" >> "$GITHUB_ENV"
           echo "ARCH=arm64" >> "$GITHUB_ENV"
-          echo "${{ env.TOOLCHAIN_AARCH64 }}" >> "$GITHUB_PATH"
-          echo "${{ env.TOOLCHAIN_ARM32 }}" >> "$GITHUB_PATH"
+          echo "${{ env.TOOLCHAIN_BIN }}" >> "$GITHUB_PATH"
 
+      # Shared make args reused by every kernel build step below.
       - name: Configure kernel
         working-directory: kernel_source
         run: |
           make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} \
+            CC=${{ env.CC }} CLANG_TRIPLE=${{ env.CLANG_TRIPLE }} \
             CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
             CROSS_COMPILE_ARM32=${{ env.CROSS_COMPILE_ARM32 }} \
+            LD=${{ env.LD }} AR=${{ env.AR }} NM=${{ env.NM }} \
+            OBJCOPY=${{ env.OBJCOPY }} OBJDUMP=${{ env.OBJDUMP }} STRIP=${{ env.STRIP }} \
             ${{ env.DEFCONFIG }}
 
       - name: (Optional) Enable NetHunter-required kernel configs
@@ -169,16 +178,22 @@ jobs:
             -e CONFIG_MAC80211 || true
 
           make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} \
+            CC=${{ env.CC }} CLANG_TRIPLE=${{ env.CLANG_TRIPLE }} \
             CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
             CROSS_COMPILE_ARM32=${{ env.CROSS_COMPILE_ARM32 }} \
+            LD=${{ env.LD }} AR=${{ env.AR }} NM=${{ env.NM }} \
+            OBJCOPY=${{ env.OBJCOPY }} OBJDUMP=${{ env.OBJDUMP }} STRIP=${{ env.STRIP }} \
             olddefconfig
 
       - name: Build kernel
         working-directory: kernel_source
         run: |
           make -j"$(nproc)" O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} \
+            CC=${{ env.CC }} CLANG_TRIPLE=${{ env.CLANG_TRIPLE }} \
             CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
-            CROSS_COMPILE_ARM32=${{ env.CROSS_COMPILE_ARM32 }}
+            CROSS_COMPILE_ARM32=${{ env.CROSS_COMPILE_ARM32 }} \
+            LD=${{ env.LD }} AR=${{ env.AR }} NM=${{ env.NM }} \
+            OBJCOPY=${{ env.OBJCOPY }} OBJDUMP=${{ env.OBJDUMP }} STRIP=${{ env.STRIP }}
 
       - name: Locate kernel image
         working-directory: kernel_source
