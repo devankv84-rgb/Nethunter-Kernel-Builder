@@ -23,6 +23,17 @@ name: Build NetHunter Kernel (Samsung gtowifi - LineageOS 22.2)
 # - Toolchain: SDM429 is a newer-ish Qualcomm CAF kernel (Linux 4.9-ish),
 #   so Clang/LLVM (as AOSP ships) usually works, but this workflow defaults
 #   to GCC for safety — switch to Clang if the kernel's own docs recommend it.
+#
+# FIX APPLIED IN THIS VERSION:
+# The previous run failed with:
+#   "arch/arm64/Makefile:66: *** CROSS_COMPILE_ARM32 not defined or empty,
+#    the compat vDSO will not be built.  Stop."
+# This happens because arm64 Android kernels build a 32-bit "compat vDSO"
+# alongside the 64-bit kernel (for 32-bit app compatibility), which needs
+# its own separate 32-bit ARM toolchain — distinct from the 64-bit one used
+# for everything else. This version installs that toolchain and sets
+# CROSS_COMPILE_ARM32 alongside CROSS_COMPILE, and passes both through to
+# every make invocation that builds the kernel.
 # ---------------------------------------------------------------------------
 
 on:
@@ -38,7 +49,7 @@ on:
 
 env:
   DEVICE_CODENAME: gtowifi                      # Samsung Galaxy Tab A 8.0 (2019)
-  DEFCONFIG: lineageos_gtowifi_defconfig        # <<< confirm against arch/arm64/configs/ in the repo >>>
+  DEFCONFIG: lineageos_gtowifi_defconfig            # <<< confirm against arch/arm64/configs/ in the repo >>>
   KERNEL_REPO: https://github.com/LineageOS/android_kernel_samsung_sdm429.git
   KERNEL_BRANCH: lineage-22.2                   # <<< confirm this branch exists; fall back if not pushed yet >>>
   NETHUNTER_KERNEL_BUILDER: https://gitlab.com/kalilinux/nethunter/build-scripts/kali-nethunter-project.git
@@ -64,6 +75,7 @@ jobs:
             git build-essential bc bison flex libssl-dev libncurses-dev \
             python3 python3-pip lz4 zip unzip wget curl \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi g++-arm-linux-gnueabi \
             device-tree-compiler cpio rsync
 
       - name: Checkout kernel source
@@ -108,12 +120,15 @@ jobs:
           # <<< If your device's kernel is too old for Clang, switch CC below to
           # aarch64-linux-gnu-gcc and drop the clang-related env vars. >>>
           echo "CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> "$GITHUB_ENV"
           echo "ARCH=arm64" >> "$GITHUB_ENV"
 
       - name: Configure kernel
         working-directory: kernel_source
         run: |
-          make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
+          make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} \
+            CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
+            CROSS_COMPILE_ARM32=${{ env.CROSS_COMPILE_ARM32 }} \
             ${{ env.DEFCONFIG }}
 
       - name: (Optional) Enable NetHunter-required kernel configs
@@ -132,14 +147,17 @@ jobs:
             -e CONFIG_CFG80211_WEXT \
             -e CONFIG_MAC80211 || true
 
-          make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
+          make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} \
+            CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
+            CROSS_COMPILE_ARM32=${{ env.CROSS_COMPILE_ARM32 }} \
             olddefconfig
 
       - name: Build kernel
         working-directory: kernel_source
         run: |
           make -j"$(nproc)" O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} \
-            CROSS_COMPILE=${{ env.CROSS_COMPILE }}
+            CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
+            CROSS_COMPILE_ARM32=${{ env.CROSS_COMPILE_ARM32 }}
 
       - name: Locate kernel image
         working-directory: kernel_source
