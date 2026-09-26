@@ -59,7 +59,7 @@ on:
       kernel_branch:
         description: "Kernel source branch/tag to build"
         required: false
-        default: "lineage-22.2"
+        default: "lineage-19.1
   push:
     tags:
       - "kernel-v*"
