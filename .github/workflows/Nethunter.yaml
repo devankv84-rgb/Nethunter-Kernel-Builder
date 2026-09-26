@@ -29,22 +29,28 @@ name: Build NetHunter Kernel (Samsung gtowifi - LineageOS 22.2)
 #   gcc-arm-linux-gnueabi and setting CROSS_COMPILE_ARM32.
 # v3 fixed: "ld: cannot represent machine `arm'" (vdso32 link failure) by
 #   switching from apt's cross-toolchain to prebuilt AOSP GCC 4.9 toolchains.
-# v4 (this version) fixes the NEXT error that appeared:
-#   "../include/linux/compiler-gcc.h:157:3: error: #error Sorry, your
-#    version of GCC is too old - please use 5.1 or newer."
-# Root cause: this kernel source tree enforces a minimum GCC version (5.1+)
-# in its headers. The GCC 4.9 prebuilt toolchain from v3 (needed to dodge
-# the vdso32 ld.bfd issue) is itself too old to satisfy that check — one
-# fix broke against the other constraint.
-# Fix: stop using GCC entirely and switch to Clang. Modern LineageOS-era
-# kernel trees (even for older SoCs like SDM429) are built and tested
-# against Clang upstream, not GCC. This version uses Proton Clang — a
-# widely used, actively maintained prebuilt package that bundles Clang
-# together with its own correctly-built GNU binutils (assembler/linker) for
-# both the 64-bit and 32-bit-compat targets. Clang reports a GCC-compatible
-# version high enough to pass the version check, and its bundled binutils
-# avoids the ld.bfd naming issue from v3 as well — so this should resolve
-# both prior errors at once.
+# v4 fixed: "your version of GCC is too old" by switching to Proton Clang.
+# v5 (this version) fixes the NEXT error that appeared:
+#   drivers/staging/prima/CORE/SYS/legacy/src/utils/src/macTrace.c:
+#   "error: use of undeclared identifier 'P2P_NOT_ACTIVE'" (and 8 similar)
+# Root cause: this is a real bug in the kernel source itself, not the build
+# environment. drivers/staging/prima is Qualcomm's legacy WCN36xx-family
+# WiFi driver — old "staging" code that was never fully cleaned up. Some of
+# its P2P state constants are declared only under a feature flag that this
+# defconfig branch doesn't enable consistently, so macTrace.c references
+# identifiers that were never declared. This driver also isn't needed for
+# our goal: it controls the tablet's *built-in* WiFi chip, whose firmware
+# doesn't expose monitor mode/injection regardless — NetHunter functionality
+# here comes from external USB adapters (see the driver hand-porting steps
+# elsewhere in this workflow), not this chip.
+# Fix: exclude drivers/staging/prima from the build entirely, rather than
+# chase down the exact missing feature macro in dead legacy code.
+# NOTE: this will disable the tablet's BUILT-IN WiFi if prima is in fact the
+# active driver stack for it. If your normal WiFi stops working after
+# flashing, this staging driver was actually load-bearing and you'll need
+# to instead fix the missing macro (add the right #ifdef guard around the
+# P2P_* cases in macTrace.c, or find and enable the matching CONFIG_ flag)
+# rather than exclude the driver.
 # ---------------------------------------------------------------------------
 
 on:
@@ -60,7 +66,7 @@ on:
 
 env:
   DEVICE_CODENAME: gtowifi                      # Samsung Galaxy Tab A 8.0 (2019)
-  DEFCONFIG: lineageos_gtowifi_defconfig             # <<< confirm against arch/arm64/configs/ in the repo >>>
+  DEFCONFIG: lineageos_gtowifi_defconfig            # <<< confirm against arch/arm64/configs/ in the repo >>>
   KERNEL_REPO: https://github.com/devankv84-rgb/android_kernel_samsung_sdm429.git
   KERNEL_BRANCH: lineage-22.2                   # <<< confirm this branch exists; fall back if not pushed yet >>>
   NETHUNTER_KERNEL_BUILDER: https://gitlab.com/kalilinux/nethunter/build-scripts/kali-nethunter-project.git
@@ -148,6 +154,22 @@ jobs:
           echo "STRIP=llvm-strip" >> "$GITHUB_ENV"
           echo "ARCH=arm64" >> "$GITHUB_ENV"
           echo "${{ env.TOOLCHAIN_BIN }}" >> "$GITHUB_PATH"
+
+      - name: Exclude broken drivers/staging/prima from the build
+        working-directory: kernel_source
+        run: |
+          # This legacy Qualcomm WCN36xx driver has a source bug (undeclared
+          # P2P_* identifiers in macTrace.c) and isn't needed for our goal —
+          # see the FIX HISTORY note at the top of this file for details.
+          if grep -rq "prima" drivers/staging/Makefile; then
+            sed -i -E 's/^(obj-.*prima.*)$/# \1 # excluded: broken staging driver, unused by this build/' \
+              drivers/staging/Makefile
+            echo "Excluded drivers/staging/prima from drivers/staging/Makefile"
+            grep -n "prima" drivers/staging/Makefile || true
+          else
+            echo "No reference to prima found in drivers/staging/Makefile — nothing to exclude."
+            echo "If the build still fails on prima, check drivers/staging/Kconfig instead."
+          fi
 
       # Shared make args reused by every kernel build step below.
       - name: Configure kernel
